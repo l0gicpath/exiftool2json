@@ -55,7 +55,7 @@ func tagsStreamer(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Connection", "keep-alive")
 	w.WriteHeader(http.StatusOK)
 
-	fmt.Fprint(w, "[")
+	fmt.Fprint(w, `{"tags":[`)
 	flusher.Flush()
 
 	pr, pw := io.Pipe()
@@ -120,7 +120,7 @@ DECODERLOOP:
 		}
 	}
 
-	fmt.Fprint(w, "]")
+	fmt.Fprint(w, "]}")
 	flusher.Flush()
 
 }
