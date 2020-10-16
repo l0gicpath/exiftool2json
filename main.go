@@ -1,13 +1,18 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"encoding/xml"
+	"flag"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
+	"os"
 	"os/exec"
+	"os/signal"
+	"syscall"
+	"time"
 )
 
 type tableXML struct {
@@ -36,82 +41,152 @@ type tagJSON struct {
 }
 
 func tagsStreamer(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "Streaming disabled - Please try again at a later time",
+			http.StatusPreconditionFailed)
+		return
+	}
 
 	// Setup http streaming
 	w.Header().Set("Transfer-Encoding", "chunked")
-	w.Header().Set("Context-Type", "application/json")
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
 	w.WriteHeader(http.StatusOK)
 
-	w.Write([]byte("[\n"))
+	fmt.Fprint(w, "[")
+	flusher.Flush()
 
 	pr, pw := io.Pipe()
 	defer pw.Close()
 
-	cmd := exec.CommandContext(ctx, "exiftool", "-listx")
-	cmd.Stdout = pw
-	cmd.Start()
-
+	// TODO(@hady): If this is a production level service in a tiered environment, where this ranks high
+	// I wouldn't simply ignore the possibility of an error taking place here.
 	go func() {
-		defer func() {
-			recover()
-		}()
-
-		xmlDecoder := xml.NewDecoder(pr)
-		jsonDecoder := json.NewEncoder(w)
-		tagsCount := 0
-		for {
-			t, err := xmlDecoder.Token()
-			if t == nil {
-				break
-			}
-
-			if err == io.EOF {
-				break
-			}
-
-			// We're going to stream one table at a time
-			switch s := t.(type) {
-			case xml.StartElement:
-				if s.Name.Local == "table" {
-					table := &tableXML{}
-					xmlDecoder.DecodeElement(table, &s)
-					for _, t := range table.Tags {
-						if tagsCount != 0 {
-							w.Write([]byte(","))
-						}
-						tagsCount++
-						var tag tagJSON
-						tag.Path = fmt.Sprintf("%s:%s", table.Name, t.Name)
-						tag.Group = table.Name
-						tag.Type = t.Type
-						tag.Writable = t.Writable
-						tag.Description = make(map[string]string)
-						for _, d := range t.Descriptions {
-							tag.Description[d.Lang] = d.Value
-						}
-						err := jsonDecoder.Encode(tag)
-						if err != nil {
-							break
-						}
-					}
-				}
-			}
-		}
-
-		w.Write([]byte("]\n"))
-		log.Printf("Streamed %d tags\n", tagsCount)
+		defer func() { recover() }()
+		ctx := r.Context()
+		cmd := exec.CommandContext(ctx, exiftoolPath, "-listx")
+		cmd.Stdout = pw
+		cmd.Run()
 	}()
 
-	cmd.Wait()
-}
+	xmlDecoder := xml.NewDecoder(pr)
+	tagsCount := 0
 
-func main() {
-	_, err := exec.LookPath("exiftool")
-	if err != nil {
-		log.Fatalln("Please make sure exiftool is installed and is in your PATH")
+DECODERLOOP:
+	for {
+		currToken, err := xmlDecoder.Token()
+		// Could break only on EOF but honestly, any issue with tokenization should kill the whole request here
+		if err != nil {
+			break
+		}
+
+		switch elm := currToken.(type) {
+		case xml.StartElement:
+			if elm.Name.Local == "table" {
+				table := &tableXML{}
+				xmlDecoder.DecodeElement(table, &elm)
+
+				for _, tag := range table.Tags {
+					if tagsCount != 0 {
+						fmt.Fprint(w, ",")
+					}
+
+					t := tagJSON{
+						Path:        fmt.Sprintf("%s:%s", table.Name, tag.Name),
+						Group:       table.Name,
+						Type:        tag.Type,
+						Writable:    tag.Writable,
+						Description: make(map[string]string),
+					}
+					for _, desc := range tag.Descriptions {
+						t.Description[desc.Lang] = desc.Value
+					}
+
+					tJSON, err := json.Marshal(t)
+					if err != nil {
+						continue
+					}
+					fmt.Fprint(w, string(tJSON))
+					tagsCount++
+				}
+				flusher.Flush()
+			}
+		case xml.EndElement:
+			if elm.Name.Local == "taginfo" {
+				break DECODERLOOP
+			}
+		}
 	}
 
-	http.HandleFunc("/tags", tagsStreamer)
-	log.Fatalln(http.ListenAndServe(":1002", nil))
+	fmt.Fprint(w, "]")
+	flusher.Flush()
+
+}
+
+type color string
+
+const (
+	cblack  color = "\u001b[30m"
+	cred          = "\u001b[31m"
+	cgreen        = "\u001b[32m"
+	cblue         = "\u001b[34m"
+	cyellow       = "\u001b[33m"
+	creset        = "\u001b[0m"
+)
+
+func colPrintlnf(c color, sfmt string, v ...interface{}) {
+	fmt.Printf("%s%s%s\n", string(c), fmt.Sprintf(sfmt, v...), string(creset))
+}
+
+var (
+	listenAddr   string
+	exiftoolPath string
+)
+
+func main() {
+	flag.StringVar(&listenAddr, "bind-address", "127.0.0.1:3000", "Address to bind the server to")
+	flag.StringVar(&exiftoolPath, "exiftool", "", "Path to exiftool")
+	flag.Parse()
+
+	if len(exiftoolPath) == 0 {
+		var err error
+		exiftoolPath, err = exec.LookPath("exiftool")
+		if err != nil {
+			colPrintlnf(cred, "No exiftool found in your PATH, please provide one")
+		}
+	}
+
+	r := http.NewServeMux()
+	r.HandleFunc("/tags", tagsStreamer)
+	r.Handle("/", http.RedirectHandler("tags", http.StatusSeeOther))
+
+	server := &http.Server{
+		Addr:         listenAddr,
+		Handler:      r,
+		WriteTimeout: 25 * time.Second,
+		IdleTimeout:  5 * time.Second,
+		ReadTimeout:  15 * time.Second,
+	}
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGHUP, syscall.SIGINT, syscall.SIGQUIT)
+
+	go func() {
+		<-quit
+		colPrintlnf(cyellow, "Shutting web server down")
+		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+		defer cancel()
+		if err := server.Shutdown(ctx); err != nil {
+			colPrintlnf(cred, "Couldn't shut web server down.\nError=%s", err.Error())
+		}
+	}()
+
+	colPrintlnf(cgreen, "Accepting requests on address: %s", listenAddr)
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		colPrintlnf(cred, "Couldn't bind server to %s.\nError=%s", listenAddr, err.Error())
+	}
+
+	colPrintlnf(cgreen, "Bye.")
 }
